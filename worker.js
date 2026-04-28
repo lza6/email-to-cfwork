@@ -1,6 +1,7 @@
 /**
- * 邮件 AI 智能看板 v8.0 (绝对稳定版)
- * 修复：URL 编码导致的状态卡死、Base64 UTF-8 中文乱码问题
+ * 邮件 AI 智能看板 v10.0 (AI 智能排序终极版)
+ * 修复：全局鼠标自然滚动、彻底移除局部滚动条
+ * 新增：今日速览独立分页、AI 自动评估重要性 (高/中/低) 并按重要级动态排版
  */
 
 export default {
@@ -23,12 +24,14 @@ export default {
       subject,
       from,
       time: new Date().getTime(),
-      status: 'processing' 
+      status: 'processing',
+      shortSummary: '', 
+      priority: '处理中' // 新增重要性字段
     };
     
     index.unshift(newEntry);
     
-    if (index.length > 500) {
+    if (index.length > 10000) {
       const removed = index.pop();
       await env.MAIL_SUMMARY_KV.delete(`body_${removed.id}`);
       await env.MAIL_SUMMARY_KV.delete(`summary_${removed.id}`);
@@ -41,7 +44,7 @@ export default {
   },
 
   // ==========================================
-  // 2. API 接口端 (修复了 URL 编码识别问题)
+  // 2. API 接口端
   // ==========================================
   async fetch(request, env) {
     const url = new URL(request.url);
@@ -58,7 +61,7 @@ export default {
     // API: 获取列表
     if (path === "/api/emails" && method === "GET") {
       const page = parseInt(url.searchParams.get("page")) || 1;
-      const limit = 20;
+      const limit = 500; 
       let index = await env.MAIL_SUMMARY_KV.get("email_index", { type: "json" }) || [];
       const total = index.length;
       const start = (page - 1) * limit;
@@ -67,7 +70,6 @@ export default {
 
     // API: 获取详情
     if (path.startsWith("/api/emails/") && method === "GET") {
-      // 关键修复 1：解码 URL 中的特殊符号（如尖括号）
       const id = decodeURIComponent(path.split("/").pop());
       let index = await env.MAIL_SUMMARY_KV.get("email_index", { type: "json" }) || [];
       const entry = index.find(e => e.id === id) || {};
@@ -90,6 +92,7 @@ export default {
       
       if (entryIndex !== -1) {
         index[entryIndex].status = 'processing';
+        index[entryIndex].priority = '处理中';
         await env.MAIL_SUMMARY_KV.put("email_index", JSON.stringify(index));
         await env.MAIL_SUMMARY_KV.delete(`summary_${id}`);
         
@@ -113,7 +116,8 @@ export default {
       <script src="https://unpkg.com/vue@3/dist/vue.global.prod.js"></script>
       <script src="https://cdn.jsdelivr.net/npm/marked/marked.min.js"></script>
       <style>
-        body { background-color: #f8fafc; color: #1e293b; }
+        /* 核心修复：移除 overflow-y: hidden，恢复浏览器全局原生滚动，支持鼠标自然滑轮 */
+        body { background-color: #f8fafc; color: #1e293b; } 
         .markdown-body { font-size: 15px; color: #334155; line-height: 1.7; }
         .markdown-body h3 { font-size: 1.15rem; font-weight: 700; color: #0f172a; margin: 1.2rem 0 0.5rem 0; border-bottom: 1px solid #e2e8f0; padding-bottom: 4px; }
         .markdown-body p { margin-bottom: 0.8rem; }
@@ -128,12 +132,23 @@ export default {
         @keyframes skeleton-loading { 0% { background-position: 200% 0; } 100% { background-position: -200% 0; } }
         details > summary::marker { display: none; }
         details > summary::-webkit-details-marker { display: none; }
+        
+        /* 原生渲染优化 */
+        .email-card-wrapper {
+          content-visibility: auto;
+          contain-intrinsic-size: auto 86px;
+        }
+
+        /* 滚动条美化 */
+        ::-webkit-scrollbar { width: 8px; }
+        ::-webkit-scrollbar-track { background: transparent; }
+        ::-webkit-scrollbar-thumb { background-color: #cbd5e1; border-radius: 10px; }
       </style>
     </head>
-    <body class="antialiased">
-      <div id="app" class="max-w-4xl mx-auto p-4 sm:p-6 lg:p-8">
+    <body class="antialiased min-h-screen">
+      <div id="app" class="max-w-4xl mx-auto p-4 sm:p-6 lg:p-8 flex flex-col">
         
-        <header class="flex justify-between items-center mb-6 bg-white p-5 rounded-2xl shadow-sm border border-gray-200">
+        <header class="flex-shrink-0 flex justify-between items-center mb-6 bg-white p-5 rounded-2xl shadow-sm border border-gray-200">
           <div>
             <h1 class="text-2xl font-bold bg-clip-text text-transparent bg-gradient-to-r from-blue-600 to-indigo-600">📬 AI 智能看板</h1>
             <p class="text-sm text-gray-500 mt-1">自动监控新邮件中 <span class="inline-block w-2 h-2 bg-green-500 rounded-full ml-1 animate-pulse"></span></p>
@@ -141,11 +156,53 @@ export default {
           <div class="text-right text-sm text-gray-500 font-medium">共计 {{ totalEmails }} 封</div>
         </header>
 
-        <div v-if="loading && emails.length === 0" class="text-center py-10 text-gray-400">首次加载数据中...</div>
-
-        <div v-else class="space-y-4">
-          <div v-for="email in emails" :key="email.id" class="bg-white rounded-xl shadow-sm border transition-all duration-200" :class="activeId === email.id ? 'ring-2 ring-blue-400 border-blue-400' : 'border-gray-200 hover:border-blue-300'">
+        <div v-if="todayEmails.length > 0" class="flex-shrink-0 mb-6 bg-blue-50 rounded-xl border border-blue-100 p-5 shadow-sm transition-all duration-300">
+          <div class="flex justify-between items-center mb-4">
+            <h2 class="text-[15px] font-bold text-blue-800 flex items-center gap-2">
+              <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M13 10V3L4 14h7v7l9-11h-7z"></path></svg>
+              今日新邮件 (按重要性自动排序)
+            </h2>
             
+            <div class="flex items-center gap-3 text-sm" v-if="todayTotalPages > 1">
+              <button @click="todayPage--" :disabled="todayPage === 1" class="w-6 h-6 flex items-center justify-center rounded-full bg-blue-100 text-blue-600 hover:bg-blue-200 disabled:opacity-30 disabled:cursor-not-allowed transition-colors font-bold">◀</button>
+              <span class="text-blue-800 font-medium">{{ todayPage }} / {{ todayTotalPages }}</span>
+              <button @click="todayPage++" :disabled="todayPage === todayTotalPages" class="w-6 h-6 flex items-center justify-center rounded-full bg-blue-100 text-blue-600 hover:bg-blue-200 disabled:opacity-30 disabled:cursor-not-allowed transition-colors font-bold">▶</button>
+            </div>
+          </div>
+          
+          <div class="min-h-[120px]">
+            <ul class="space-y-3">
+              <li v-for="em in paginatedTodayEmails" :key="'today-'+em.id" class="text-sm flex items-start gap-3 bg-white/60 p-2.5 rounded-lg border border-blue-100/50 hover:bg-white transition-colors">
+                <span class="text-gray-400 font-mono text-xs mt-0.5 whitespace-nowrap">{{ new Date(em.time).toLocaleTimeString([], {hour: '2-digit', minute:'2-digit'}) }}</span>
+                <div class="flex-1 min-w-0">
+                  <div class="flex items-center gap-2 flex-wrap">
+                    <span v-if="em.priority === '高'" class="px-1.5 py-0.5 text-[10px] font-bold bg-red-100 text-red-600 rounded">🔴 高优</span>
+                    <span v-else-if="em.priority === '中'" class="px-1.5 py-0.5 text-[10px] font-bold bg-yellow-100 text-yellow-700 rounded">🟡 普通</span>
+                    <span v-else-if="em.priority === '低'" class="px-1.5 py-0.5 text-[10px] font-bold bg-green-100 text-green-700 rounded">🟢 次要</span>
+                    <span v-else-if="em.status === 'error'" class="px-1.5 py-0.5 text-[10px] font-bold bg-gray-100 text-gray-500 rounded">解析异常</span>
+                    <span v-else class="px-1.5 py-0.5 text-[10px] font-bold bg-blue-100 text-blue-500 rounded flex items-center gap-1"><span class="pulse-dot !w-1.5 !h-1.5"></span> 处理中</span>
+
+                    <a href="javascript:void(0)" @click="jumpToEmail(em)" class="text-blue-700 hover:text-blue-900 font-semibold hover:underline truncate">
+                      {{ em.subject || '无主题' }}
+                    </a>
+                  </div>
+                  <p class="text-gray-500 text-xs mt-1 line-clamp-1" v-if="em.shortSummary">{{ em.shortSummary }}</p>
+                </div>
+              </li>
+            </ul>
+          </div>
+        </div>
+
+        <div v-if="loading && emails.length === 0" class="text-center py-10 text-gray-400 flex-1">首次加载数据中...</div>
+
+        <div v-else class="flex-1 pb-10">
+          <div 
+            v-for="email in visibleEmails" 
+            :key="email.id" 
+            :id="'email-card-' + email.id" 
+            class="email-card-wrapper mb-4 bg-white rounded-xl shadow-sm border transition-all duration-200 mt-1" 
+            :class="activeId === email.id ? 'ring-2 ring-blue-400 border-blue-400' : 'border-gray-200 hover:border-blue-300'"
+          >
             <div @click="toggle(email)" class="p-4 cursor-pointer flex justify-between items-center gap-4 hover:bg-slate-50 transition-colors" :class="{'rounded-t-xl': activeId === email.id, 'rounded-xl': activeId !== email.id}">
               <div class="flex-shrink-0 text-gray-400 transition-transform duration-300" :class="{'rotate-90': activeId === email.id}">
                 <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M9 5l7 7-7 7"></path></svg>
@@ -153,9 +210,14 @@ export default {
 
               <div class="flex-1 min-w-0">
                 <div class="flex items-center gap-2 mb-1">
-                  <span v-if="!isRead(email.id)" class="w-2 h-2 rounded-full bg-blue-500"></span>
+                  <span v-if="!isRead(email.id)" class="w-2 h-2 rounded-full bg-blue-500 flex-shrink-0"></span>
+                  
+                  <span v-if="email.priority === '高'" class="flex-shrink-0 text-[10px] font-bold text-red-600 bg-red-50 px-1 border border-red-100 rounded">高优</span>
+                  <span v-else-if="email.priority === '中'" class="flex-shrink-0 text-[10px] font-bold text-yellow-600 bg-yellow-50 px-1 border border-yellow-100 rounded">普通</span>
+                  <span v-else-if="email.priority === '低'" class="flex-shrink-0 text-[10px] font-bold text-green-600 bg-green-50 px-1 border border-green-100 rounded">次要</span>
+                  
                   <span class="text-sm font-medium text-gray-600 truncate">{{ email.from.split('<')[0] }}</span>
-                  <span class="text-xs text-gray-400">&bull; {{ new Date(email.time).toLocaleString() }}</span>
+                  <span class="text-xs text-gray-400 flex-shrink-0">&bull; {{ new Date(email.time).toLocaleString() }}</span>
                 </div>
                 <h2 class="text-lg font-bold text-gray-800 truncate" :class="{'text-gray-500 font-medium': isRead(email.id)}">{{ email.subject }}</h2>
               </div>
@@ -164,7 +226,7 @@ export default {
                 <span v-if="email.status === 'completed'" class="px-2.5 py-1 text-xs font-medium bg-green-100 text-green-700 rounded-lg">✓ 已总结</span>
                 <span v-else-if="email.status === 'error'" class="px-2.5 py-1 text-xs font-medium bg-red-100 text-red-700 rounded-lg">⚠ 失败</span>
                 <span v-else class="px-2.5 py-1 text-xs font-medium bg-yellow-50 text-yellow-700 rounded-lg border border-yellow-200 flex items-center gap-2">
-                  <span class="pulse-dot"></span> AI 思考中
+                  <span class="pulse-dot"></span> 思考中
                 </span>
               </div>
             </div>
@@ -180,8 +242,7 @@ export default {
               <div v-else>
                 <div v-if="email.status === 'processing'" class="flex flex-col items-center justify-center py-6">
                   <div class="w-8 h-8 border-4 border-blue-200 border-t-blue-600 rounded-full animate-spin mb-4"></div>
-                  <p class="text-gray-500 font-medium">模型正在处理，请稍候...</p>
-                  <p class="text-xs text-gray-400 mt-2">（完成后将自动在此处显示）</p>
+                  <p class="text-gray-500 font-medium">模型正在深度解析并评估邮件重要性...</p>
                 </div>
 
                 <div v-else-if="email.status === 'completed'" class="bg-white p-6 rounded-lg border border-gray-200 shadow-sm markdown-body" v-html="renderMarkdown(activeDetail.summary)"></div>
@@ -206,7 +267,7 @@ export default {
           </div>
         </div>
 
-        <div class="flex justify-center items-center gap-6 mt-8" v-if="totalPages > 1">
+        <div class="flex justify-center items-center gap-6 mt-6 pb-10 flex-shrink-0" v-if="totalPages > 1">
           <button @click="fetchList(currentPage - 1)" :disabled="currentPage === 1" class="px-4 py-2 bg-white border rounded shadow-sm disabled:opacity-50 text-sm font-medium hover:bg-gray-50">上一页</button>
           <span class="text-sm text-gray-600 font-medium">第 {{ currentPage }} / {{ totalPages }} 页</span>
           <button @click="fetchList(currentPage + 1)" :disabled="currentPage === totalPages" class="px-4 py-2 bg-white border rounded shadow-sm disabled:opacity-50 text-sm font-medium hover:bg-gray-50">下一页</button>
@@ -215,9 +276,9 @@ export default {
       </div>
 
       <script>
-        const { createApp, ref, onMounted, onUnmounted } = Vue;
+        const { createApp, ref, computed, onMounted, onUnmounted, nextTick, watch } = Vue;
 
-        createApp({
+        const app = createApp({
           setup() {
             const emails = ref([]);
             const loading = ref(true);
@@ -230,8 +291,70 @@ export default {
             const currentPage = ref(1);
             const totalPages = ref(1);
             
+            // 增量渲染的核心控制
+            const displayCount = ref(30);
+            
+            // 今日面板的分页控制
+            const todayPage = ref(1);
+            const todayPageSize = 5; // 置顶区每页展示 5 条
+            
             let pollInterval = null; 
             let autoRefreshInterval = null; 
+
+            // AI 智能排序权重：高 > 中 > 低 > 处理中 > 错误
+            const priorityWeight = { '高': 4, '中': 3, '低': 2, '处理中': 1, 'error': 0 };
+
+            // 计算属性：今天的所有邮件，并根据 AI 判定重要性进行排序
+            const todayEmails = computed(() => {
+              const today = new Date().toDateString();
+              const filtered = emails.value.filter(e => new Date(e.time).toDateString() === today);
+              
+              // 按重要程度智能排序
+              return filtered.sort((a, b) => {
+                const weightA = priorityWeight[a.priority || (a.status==='error'?'error':'处理中')] || 1;
+                const weightB = priorityWeight[b.priority || (b.status==='error'?'error':'处理中')] || 1;
+                if (weightA !== weightB) {
+                  return weightB - weightA; // 权重高的在前
+                }
+                // 权重相同，按时间倒序
+                return b.time - a.time;
+              });
+            });
+
+            // 今日速览区的总页数
+            const todayTotalPages = computed(() => {
+              return Math.ceil(todayEmails.value.length / todayPageSize) || 1;
+            });
+
+            // 置顶面板分页切片
+            const paginatedTodayEmails = computed(() => {
+              const start = (todayPage.value - 1) * todayPageSize;
+              return todayEmails.value.slice(start, start + todayPageSize);
+            });
+            
+            // 确保如果页码超限自动回退
+            watch(todayTotalPages, (newVal) => {
+               if (todayPage.value > newVal) todayPage.value = newVal;
+               if (todayPage.value < 1) todayPage.value = 1;
+            });
+
+            // 渐进式提供渲染数据 (万级列表不卡顿)
+            const visibleEmails = computed(() => {
+              return emails.value.slice(0, displayCount.value);
+            });
+
+            // 核心修复：监听全局 Window 滚动，完美支持鼠标上下自然滚动
+            const handleWindowScroll = () => {
+              const scrollTop = document.documentElement.scrollTop || document.body.scrollTop;
+              const scrollHeight = document.documentElement.scrollHeight || document.body.scrollHeight;
+              const clientHeight = document.documentElement.clientHeight || window.innerHeight;
+              
+              if (scrollTop + clientHeight >= scrollHeight - 600) {
+                if (displayCount.value < emails.value.length) {
+                  displayCount.value += 30; // 顺滑补充加载 30 个 DOM
+                }
+              }
+            };
 
             const fetchList = async (page = 1, silent = false) => {
               if (!silent) loading.value = true;
@@ -243,21 +366,22 @@ export default {
                   const activeLocal = emails.value.find(e => e.id === activeId.value);
                   const activeRemote = data.list.find(e => e.id === activeId.value);
                   if (activeLocal && activeLocal.status === 'processing' && activeRemote && activeRemote.status === 'completed') {
-                    activeRemote.status = 'processing';
+                    activeRemote.status = 'processing'; // 维持 UI 平滑
                   }
                 }
                 
                 emails.value = data.list;
                 totalEmails.value = data.total;
                 currentPage.value = data.page;
-                totalPages.value = Math.ceil(data.total / 20) || 1;
+                totalPages.value = Math.ceil(data.total / 500) || 1; 
+                
+                if (!silent) displayCount.value = 30; 
               } catch (e) { console.error("获取列表失败"); }
               if (!silent) loading.value = false;
             };
 
             const fetchDetail = async (email) => {
               try {
-                // 前端请求时，也会自动编码 URI
                 const res = await fetch(\`/api/emails/\${encodeURIComponent(email.id)}\`);
                 const data = await res.json();
                 activeDetail.value = data;
@@ -305,10 +429,41 @@ export default {
                 detailLoading.value = false;
                 startPolling(email);
               }
+
+              nextTick(() => {
+                setTimeout(() => {
+                  const el = document.getElementById(\`email-card-\${email.id}\`);
+                  // 稍微往上偏移一点，防止被置顶区遮挡视线
+                  if (el) {
+                    const y = el.getBoundingClientRect().top + window.scrollY - 20;
+                    window.scrollTo({top: y, behavior: 'smooth'});
+                  }
+                }, 100); 
+              });
+            };
+
+            const jumpToEmail = async (email) => {
+              const index = emails.value.findIndex(e => e.id === email.id);
+              if (index !== -1 && index >= displayCount.value) {
+                displayCount.value = index + 15;
+              }
+              
+              if (activeId.value !== email.id) {
+                await toggle(email);
+              } else {
+                nextTick(() => {
+                  const el = document.getElementById(\`email-card-\${email.id}\`);
+                  if (el) {
+                    const y = el.getBoundingClientRect().top + window.scrollY - 20;
+                    window.scrollTo({top: y, behavior: 'smooth'});
+                  }
+                });
+              }
             };
 
             const retry = async (email) => {
               email.status = 'processing';
+              email.priority = '处理中';
               activeDetail.value.summary = ''; 
               try {
                 await fetch(\`/api/retry/\${encodeURIComponent(email.id)}\`, { method: 'POST' });
@@ -320,27 +475,33 @@ export default {
             const renderMarkdown = (text) => text ? marked.parse(text) : '';
 
             const startAutoRefresh = () => {
+              // 10秒后台无感刷新，AI分析完成后会自动重新排序顶部面板
               autoRefreshInterval = setInterval(() => {
                 if (currentPage.value === 1) fetchList(1, true);
               }, 10000);
             }
 
             onMounted(() => {
+              window.addEventListener('scroll', handleWindowScroll);
               fetchList(1);
               startAutoRefresh();
             });
             
             onUnmounted(() => {
+              window.removeEventListener('scroll', handleWindowScroll);
               stopPolling();
               if (autoRefreshInterval) clearInterval(autoRefreshInterval);
             });
 
             return { 
               emails, loading, detailLoading, activeId, activeDetail, toggle, 
-              isRead, renderMarkdown, retry, fetchList, currentPage, totalPages, totalEmails 
+              isRead, renderMarkdown, retry, fetchList, currentPage, totalPages, totalEmails,
+              todayEmails, paginatedTodayEmails, todayPage, todayTotalPages, jumpToEmail, visibleEmails
             };
           }
-        }).mount('#app');
+        });
+        
+        app.mount('#app');
       </script>
     </body>
     </html>`;
@@ -349,21 +510,20 @@ export default {
 };
 
 // ==========================================
-// 核心后台逻辑 (修复了中文乱码)
+// 核心后台逻辑
 // ==========================================
 function extractTextBody(rawEmail) {
   try {
     const base64Match = rawEmail.match(/(?:Content-Transfer-Encoding:\s*base64\s*\n\s*\n)([\s\S]*?)(?=\n--|\n\n--)/i);
     let decodedText = rawEmail;
     
-    // 关键修复 2：正确处理 Base64 的 UTF-8 中文解码
     if (base64Match) {
       try {
         const binString = atob(base64Match[1].replace(/\s/g, ''));
         const bytes = Uint8Array.from(binString, (m) => m.codePointAt(0));
         decodedText = new TextDecoder('utf-8').decode(bytes);
       } catch (e) {
-        decodedText = rawEmail; // 失败则回退，绝不乱码
+        decodedText = rawEmail; 
       }
     }
     
@@ -375,42 +535,73 @@ function extractTextBody(rawEmail) {
       .replace(/&nbsp;/g, ' ')
       .substring(0, 150000).trim();
   } catch (e) { 
-    // 终极保护：即使全盘崩溃，也要回退到 v3.0 的原始纯文本模式
     return rawEmail.replace(/<[^>]+>/g, ' ').substring(0, 20000); 
   }
+}
+
+function chunkTextWithOverlap(text, chunkSize = 15000, overlap = 2000) {
+  if (text.length <= chunkSize) return [text];
+  const chunks = [];
+  let start = 0;
+  while (start < text.length) {
+    chunks.push(text.slice(start, start + chunkSize));
+    if (start + chunkSize >= text.length) break;
+    start += chunkSize - overlap;
+  }
+  return chunks;
 }
 
 async function processAI(env, msgId, subject, cleanBody) {
   try {
     let finalSummary = "";
-    if (cleanBody.length > 40000) {
-      const chunks = cleanBody.match(/[\s\S]{1,40000}/g);
+    if (cleanBody.length > 20000) {
+      const chunks = chunkTextWithOverlap(cleanBody, 15000, 2000);
       let tempSummaries = [];
       for (let i = 0; i < Math.min(chunks.length, 3); i++) { 
-        const chunkSummary = await callDeepSeek(env, subject, `[部分 ${i+1}]:\n${chunks[i]}`);
+        const chunkSummary = await callDeepSeek(env, subject, `[上下文片段 ${i+1}]:\n${chunks[i]}`);
         tempSummaries.push(chunkSummary);
       }
-      finalSummary = await callDeepSeek(env, subject, `这是各部分摘要，请融合成一份最终报告：\n${tempSummaries.join('\n\n')}`);
+      finalSummary = await callDeepSeek(env, subject, `这是该长邮件按段落提取的各部分摘要，请融合成一份最终的完整报告，务必不要遗漏关键细节：\n${tempSummaries.join('\n\n')}`);
     } else {
       finalSummary = await callDeepSeek(env, subject, cleanBody);
     }
+
+    // 核心改进：提取简短摘要
+    let shortSummary = "";
+    const coreMatch = finalSummary.match(/### 📌 核心摘要\n([\s\S]*?)(?=\n###|$)/);
+    if (coreMatch && coreMatch[1]) {
+        shortSummary = coreMatch[1].trim().split('\n')[0].substring(0, 80);
+    }
+
+    // 核心改进：提取AI对重要级别的评定
+    let priority = "中"; // 默认重要级
+    const priorityMatch = finalSummary.match(/重要级别[^\n]*?\n?\s*([高中低])/);
+    if (priorityMatch && priorityMatch[1]) {
+        priority = priorityMatch[1];
+    }
+
     await env.MAIL_SUMMARY_KV.put(`summary_${msgId}`, finalSummary);
-    await updateIndexStatus(env, msgId, 'completed');
+    await updateIndexStatus(env, msgId, 'completed', shortSummary, priority);
   } catch (err) {
     console.error("AI 报错:", err);
     await env.MAIL_SUMMARY_KV.put(`summary_${msgId}`, `系统级报错原因: ${err.message}`);
-    await updateIndexStatus(env, msgId, 'error');
+    await updateIndexStatus(env, msgId, 'error', '', 'error');
   }
 }
 
 async function callDeepSeek(env, subject, content) {
   const payload = {
     model: env.MODEL_NAME,
+    // 更新 Prompt：强制要求 AI 对邮件重要性进行评判
     messages: [
       { 
         role: 'system', 
         content: `你是一位专业且高效的邮件阅读助手。
-        请严格按以下要求输出 Markdown：
+        请严格按以下要求输出 Markdown 格式的报告：
+        
+        ### 🎯 重要级别
+        (必须且仅能从这三个字中选择一个输出：高、中、低。判断依据：高=需紧急处理/报警/核心业务；中=常规通知/日常沟通；低=广告/推销/垃圾邮件)
+        
         ### 📌 核心摘要
         (一句话概括发件人意图)
         
@@ -440,11 +631,14 @@ async function callDeepSeek(env, subject, content) {
   return data.choices[0].message.content;
 }
 
-async function updateIndexStatus(env, msgId, status) {
+// 保存提取出的重要性评级 (priority)
+async function updateIndexStatus(env, msgId, status, shortSummary = "", priority = "") {
   let index = await env.MAIL_SUMMARY_KV.get("email_index", { type: "json" }) || [];
   const entryIndex = index.findIndex(e => e.id === msgId);
   if (entryIndex !== -1) {
     index[entryIndex].status = status;
+    if (shortSummary) index[entryIndex].shortSummary = shortSummary;
+    if (priority) index[entryIndex].priority = priority;
     await env.MAIL_SUMMARY_KV.put("email_index", JSON.stringify(index));
   }
 }
